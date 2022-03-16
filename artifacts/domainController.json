@@ -1,0 +1,683 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "adminUsername": {
+            "type": "String",
+            "metadata": {
+                "description": "The Windows administrative user name."
+            }
+        },
+        "adminPassword": {
+            "type": "SecureString",
+            "metadata": {
+                "description": "The Windows administrative password."
+            }
+        },
+        "windowsOSVersion": {
+            "defaultValue": "2019-Datacenter",
+            "type": "String",
+            "metadata": {
+                "description": "The Windows version for both virtual machines. This will pick a fully patched image of this given Windows version."
+            }
+        },
+        "dcVirtualMachineSize": {
+            "defaultValue": "Standard_B2ms",
+            "allowedValues": [
+                "Standard_B2ms",
+                "Standard_D2s_v3",
+                "Standard_D4s_v3",
+                "Standard_D8s_v3"
+            ],
+            "type": "String",
+            "metadata": {
+                "description": "The size of the Domain Controller virtual machine. We have given you an option of using a burstable machine for the domain controller, which in most use cases will be adequate as the CPU requirements for AD DS are not high. If you plan on running other services on top of your domain controller, consider the other options, D2s_v3 (2vCPU/8GB vRAM), D4s_v3 (4vCPU/16GB vRAM) or D8s_v3 (8vCPU/32GB vRAM)."
+            }
+        },
+        "addtlDataDiskSize": {
+            "defaultValue": "32",
+            "allowedValues": [
+                "None",
+                "32",
+                "64",
+                "128",
+                "256",
+                "512",
+                "1024",
+                "2048"
+            ],
+            "type": "String",
+            "metadata": {
+                "description": "An additional data disk is added to the domain controller for you to store and share data on. Please pick the size you would allocated to this disk."
+            }
+        },
+        "fqDomainName": {
+            "type": "String",
+            "metadata": {
+                "description": "The Domain name for the newly created ADDS domain. In order to use the AD Connect synchronization, this must be a routable domain that is verified in Office 365/Azure Active Directory. It must be a valid Internet domain name (for example, .com, .org, .net, .us, etc.)."
+            }
+        },
+        "deployBastion": {
+            "defaultValue": false,
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "deployVPNGateway": {
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "deploySecondaryServer": {
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "secondaryServerName": {
+            "defaultValue": "",
+            "type": "String"
+        },
+        "secondaryServerSize": {
+            "allowedValues": [
+                "Standard_B2ms",
+                "Standard_D2s_v3",
+                "Standard_D4s_v3",
+                "Standard_D8s_v3"
+            ],
+            "type": "String"
+        },
+        "deployManagementVM": {
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "managementVMName": {
+            "defaultValue": "",
+            "type": "String"
+        },
+        "installADConnect": {
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "managementVMSize": {
+            "allowedValues": [
+                "Standard_B2ms",
+                "Standard_D2s_v3",
+                "Standard_D4s_v3",
+                "Standard_D8s_v3"
+            ],
+            "type": "String"
+        },
+        "installIIS": {
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "installDHCP": {
+            "allowedValues": [
+                true,
+                false
+            ],
+            "type": "Bool"
+        },
+        "allowRdp": {
+            "type": "Bool"
+        }
+    },
+    "variables": {
+        "dcServername": "azuredc",
+        "defNsg": "default-nsg",
+        "adVnetName": "[concat('ADVNET',resourceGroup().name)]",
+        "adSubnetName": "[concat('ADStaticSubnet',resourceGroup().name)]",
+        "extensionName": "Microsoft.Insights.VMDiagnosticsSettings",
+        "deployBastion": "[if(parameters('deployBastion'), 'Yes', 'No')]",
+        "deployVPNGateway": "[if(parameters('deployVPNGateway'), 'Yes', 'No')]",
+        "gatewayName": "IA-VPNGateway",
+        "gatewayPIPName": "VPNGateway-PIP",
+        "gatewaySubnetName": "GatewaySubnet",
+        "vpnGatewayGeneration": "None",
+        "gatewayType": "Vpn",
+        "vpnType": "PolicyBased",
+        "updateVNetDNS1": "updateVNetDNS",
+        "deployManagementVM": "deployManagementVM",
+        "secondaryServer": "secondaryServer",
+        "vnetAddressRange": "10.0.0.0/16",
+        "subnetAddressRange": "10.0.0.0/24",
+        "dnsServerPrivateIp": "10.0.0.4",
+        "publicIpAddressName": "DomainController-PIP",
+        "publicIpAddressSKU": "Basic",
+        "subnet-id": "[concat(resourceId('Microsoft.Network/virtualNetworks', variables('adVnetName')),'/subnets/', variables('adSubnetName'))]",
+        "storageAccountName": "[concat('diagsa', uniquestring(resourceGroup().id))]",
+        "storageAccountType": "Standard_LRS",
+        "dcDataDisk": "32",
+        "dscExtensionName": "InstallDomainController",
+        "adcExtensionName": "getADC",
+        "accountid": "[concat('/subscriptions/', subscription().subscriptionId, '/resourceGroups/', resourceGroup().name, '/providers/','Microsoft.Storage/storageAccounts/', variables('storageAccountName'))]",
+        "wadlogs": "<WadCfg> <DiagnosticMonitorConfiguration overallQuotaInMB=\"4096\" xmlns=\"http://schemas.microsoft.com/ServiceHosting/2010/10/DiagnosticsConfiguration\"> <DiagnosticInfrastructureLogs scheduledTransferLogLevelFilter=\"Error\"/> <WindowsEventLog scheduledTransferPeriod=\"PT1M\" > <DataSource name=\"Application!*[System[(Level = 1 or Level = 2)]]\" /> <DataSource name=\"Security!*[System[(Level = 1 or Level = 2)]]\" /> <DataSource name=\"System!*[System[(Level = 1 or Level = 2)]]\" /></WindowsEventLog>",
+        "wadperfcounters1": "<PerformanceCounters scheduledTransferPeriod=\"PT1M\"><PerformanceCounterConfiguration counterSpecifier=\"\\Processor(_Total)\\% Processor Time\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"CPU utilization\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Processor(_Total)\\% Privileged Time\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"CPU privileged time\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Processor(_Total)\\% User Time\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"CPU user time\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Processor Information(_Total)\\Processor Frequency\" sampleRate=\"PT15S\" unit=\"Count\"><annotation displayName=\"CPU frequency\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\System\\Processes\" sampleRate=\"PT15S\" unit=\"Count\"><annotation displayName=\"Processes\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Process(_Total)\\Thread Count\" sampleRate=\"PT15S\" unit=\"Count\"><annotation displayName=\"Threads\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Process(_Total)\\Handle Count\" sampleRate=\"PT15S\" unit=\"Count\"><annotation displayName=\"Handles\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Memory\\% Committed Bytes In Use\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"Memory usage\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Memory\\Available Bytes\" sampleRate=\"PT15S\" unit=\"Bytes\"><annotation displayName=\"Memory available\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Memory\\Committed Bytes\" sampleRate=\"PT15S\" unit=\"Bytes\"><annotation displayName=\"Memory committed\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\Memory\\Commit Limit\" sampleRate=\"PT15S\" unit=\"Bytes\"><annotation displayName=\"Memory commit limit\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\% Disk Time\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"Disk active time\" locale=\"en-us\"/></PerformanceCounterConfiguration>",
+        "wadperfcounters2": "<PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\% Disk Read Time\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"Disk active read time\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\% Disk Write Time\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"Disk active write time\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\Disk Transfers/sec\" sampleRate=\"PT15S\" unit=\"CountPerSecond\"><annotation displayName=\"Disk operations\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\Disk Reads/sec\" sampleRate=\"PT15S\" unit=\"CountPerSecond\"><annotation displayName=\"Disk read operations\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\Disk Writes/sec\" sampleRate=\"PT15S\" unit=\"CountPerSecond\"><annotation displayName=\"Disk write operations\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\Disk Bytes/sec\" sampleRate=\"PT15S\" unit=\"BytesPerSecond\"><annotation displayName=\"Disk speed\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec\" sampleRate=\"PT15S\" unit=\"BytesPerSecond\"><annotation displayName=\"Disk read speed\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec\" sampleRate=\"PT15S\" unit=\"BytesPerSecond\"><annotation displayName=\"Disk write speed\" locale=\"en-us\"/></PerformanceCounterConfiguration><PerformanceCounterConfiguration counterSpecifier=\"\\LogicalDisk(_Total)\\% Free Space\" sampleRate=\"PT15S\" unit=\"Percent\"><annotation displayName=\"Disk free space (percentage)\" locale=\"en-us\"/></PerformanceCounterConfiguration></PerformanceCounters>",
+        "wadcfgxstart": "[concat(variables('wadlogs'), variables('wadperfcounters1'), variables('wadperfcounters2'), '<Metrics resourceId=\"')]",
+        "wadmetricsresourceid": "[concat('/subscriptions/', subscription().subscriptionId, '/resourceGroups/', resourceGroup().name , '/providers/', 'Microsoft.Compute/virtualMachines/')]",
+        "wadcfgxend": "\"><MetricAggregation scheduledTransferPeriod=\"PT1H\"/><MetricAggregation scheduledTransferPeriod=\"PT1M\"/></Metrics></DiagnosticMonitorConfiguration></WadCfg>",
+        "configureVnetDNSUri": "https://raw.githubusercontent.com/apcapodilupo/Infrastructure-Essentials-Artifacts/main/DomainController/vnet-with-dns-server.json",
+        "managementVMUri": "https://raw.githubusercontent.com/apcapodilupo/Infrastructure-Essentials-Artifacts/main/DomainController/managementVM_DOMAIN.json",
+        "secondaryServerUri": "https://raw.githubusercontent.com/apcapodilupo/Infrastructure-Essentials-Artifacts/main/DomainController/secondaryServer_DOMAIN.json",
+        "DSCUri": "https://github.com/apcapodilupo/Infrastructure-Essentials-Artifacts/blob/main/DomainController/DSC/builddc.zip?raw=true",
+        "dscConfiguration": "dsc_createdomain.ps1\\CreateADPDC",
+        "adConnectUri": "https://raw.githubusercontent.com/apcapodilupo/Infrastructure-Essentials-Artifacts/main/DomainController/Scripts/getADC.ps1",
+        "location": "[resourceGroup().location]",
+        "resourceGroup": "[resourceGroup().name]",
+        "localAdminName": "[first(split(parameters('adminUsername'), '@'))]",
+        "subnets": [
+            {
+                "name": "[variables('adSubnetName')]",
+                "properties": {
+                    "addressPrefix": "[variables('subnetAddressRange')]",
+                    "networksecuritygroup": {
+                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', 'default-nsg')]"
+                    },
+                    "serviceEndpoints": [
+                        {
+                            "service": "Microsoft.Storage"
+                        }
+                    ]
+                }
+            }
+        ],
+        "noAddtlDataDisks": [
+            {
+                "name": "[concat(variables('dcServerName'),'-dcDataDrive')]",
+                "diskSizeGB": "[variables('dcDataDisk')]",
+                "lun": 0,
+                "createOption": "Empty",
+                "caching": "None"
+            }
+        ],
+        "dataDisks": [
+            {
+                "name": "[concat(variables('dcServerName'),'-dcDataDrive')]",
+                "diskSizeGB": "[variables('dcDataDisk')]",
+                "lun": 0,
+                "createOption": "Empty",
+                "caching": "None"
+            },
+            {
+                "name": "[concat(variables('dcServerName'),'-addtlDataDrive')]",
+                "diskSizeGB": "[parameters('addtlDataDiskSize')]",
+                "lun": 1,
+                "createOption": "Empty",
+                "caching": "ReadOnly"
+            }
+        ],
+        "setDataDisks": "[if(equals(parameters('addtlDataDiskSize'), 'None'), variables('noAddtlDataDisks'), variables('dataDisks'))]",
+        "rdpRule": [
+            {
+                "name": "rdp-rule",
+                "properties": {
+                    "description": "Allow RDP",
+                    "protocol": "Tcp",
+                    "sourcePortRange": "*",
+                    "destinationPortRange": "3389",
+                    "sourceAddressPrefix": "Internet",
+                    "destinationAddressPrefix": "*",
+                    "access": "Allow",
+                    "priority": 100,
+                    "direction": "Inbound"
+                }
+            }
+        ],
+        "publicIpAddress": {
+            "id": "[resourceId(resourceGroup().name, 'Microsoft.Network/publicIpAddresses', variables('publicIpAddressName'))]"
+        },
+        "publicIpConfig": [
+            {
+                "name": "pipconfig",
+                "properties": {
+                    "privateIPAllocationMethod": "Dynamic",
+                    "subnet": {
+                        "id": "[variables('subnet-id')]"
+                    },
+                    "publicIpAddress": "[variables('publicIpAddress')]"
+                }
+            }
+        ],
+        "noPublicIpConfig": [
+            {
+                "name": "noPipconfig",
+                "properties": {
+                    "privateIPAllocationMethod": "Dynamic",
+                    "subnet": {
+                        "id": "[variables('subnet-id')]"
+                    }
+                }
+            }
+        ],
+        "setIpConfig": "[if(parameters('allowRdp'), variables('publicIpConfig'), variables('noPublicIpConfig'))]",
+        "securityRules": [],
+        "setSecurityRules": "[ if(parameters('allowRdp'), variables('rdpRule'), variables('securityRules'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.Network/networkSecurityGroups",
+            "apiVersion": "2018-08-01",
+            "name": "[variables('defNsg')]",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "securityRules": "[variables('setSecurityRules')]"
+            }
+        },
+        {
+            "type": "Microsoft.Network/virtualNetworks",
+            "apiVersion": "2016-12-01",
+            "name": "[variables('adVnetName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[concat('Microsoft.Network/networkSecurityGroups/', variables('defNsg'))]"
+            ],
+            "properties": {
+                "addressSpace": {
+                    "addressPrefixes": [
+                        "[variables('vnetAddressRange')]"
+                    ]
+                },
+                "subnets": [
+                    {
+                        "name": "[variables('adSubnetName')]",
+                        "properties": {
+                            "addressPrefix": "[variables('subnetAddressRange')]",
+                            "serviceEndpoints": [
+                                {
+                                    "service": "Microsoft.Storage"
+                                }
+                            ],
+                            "networksecuritygroup": {
+                                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', 'default-nsg')]"
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "type": "Microsoft.Network/publicIpAddresses",
+            "apiVersion": "2019-02-01",
+            "name": "[variables('publicIpAddressName')]",
+            "location": "[variables('location')]",
+            "sku": {
+                "name": "[variables('publicIpAddressSKU')]"
+            },
+            "properties": {
+                "publicIpAllocationMethod": "Dynamic"
+            },
+            "condition": "[parameters('allowRdp')]"
+        },
+        {
+            "type": "Microsoft.Network/networkInterfaces",
+            "apiVersion": "2016-03-30",
+            "name": "[concat(variables('dcServerName'),'-nic')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[variables('adVnetName')]"
+            ],
+            "properties": {
+                "ipConfigurations": "[variables('setIpConfig')]"
+            }
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "apiVersion": "2016-01-01",
+            "name": "[variables('storageAccountName')]",
+            "location": "[resourceGroup().location]",
+            "sku": {
+                "name": "[variables('storageAccountType')]"
+            },
+            "kind": "Storage",
+            "properties": {}
+        },
+        {
+            "type": "Microsoft.Compute/virtualMachines",
+            "apiVersion": "2018-06-01",
+            "name": "[variables('dcServerName')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Network/networkInterfaces/', concat(variables('dcServerName'),'-nic'))]"
+            ],
+            "properties": {
+                "hardwareProfile": {
+                    "vmSize": "[parameters('dcVirtualMachineSize')]"
+                },
+                "osProfile": {
+                    "computerName": "[variables('dcServerName')]",
+                    "adminUsername": "[variables('localAdminName')]",
+                    "adminPassword": "[parameters('adminPassword')]"
+                },
+                "storageProfile": {
+                    "imageReference": {
+                        "publisher": "MicrosoftWindowsServer",
+                        "offer": "WindowsServer",
+                        "sku": "[parameters('windowsOSVersion')]",
+                        "version": "latest"
+                    },
+                    "osDisk": {
+                        "name": "[concat(variables('dcServerName'),'-osDisk')]",
+                        "caching": "ReadWrite",
+                        "createOption": "FromImage",
+                        "managedDisk": {
+                            "storageAccountType": "Premium_LRS"
+                        }
+                    },
+                    "dataDisks": "[variables('setDataDisks')]"
+                },
+                "networkProfile": {
+                    "networkInterfaces": [
+                        {
+                            "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(variables('dcServerName'),'-nic'))]"
+                        }
+                    ]
+                },
+                "diagnosticsProfile": {
+                    "bootDiagnostics": {
+                        "enabled": "true",
+                        "storageUri": "[reference(resourceId('Microsoft.Storage/storageAccounts/', variables('storageAccountName'))).primaryEndpoints.blob]"
+                    }
+                }
+            },
+            "resources": [
+                {
+                    "type": "extensions",
+                    "apiVersion": "2018-06-01",
+                    "name": "[variables('extensionName')]",
+                    "location": "[resourceGroup().location]",
+                    "dependsOn": [
+                        "[concat('Microsoft.Compute/virtualMachines/', variables('dcServerName'))]"
+                    ],
+                    "tags": {
+                        "displayName": "AzureDiagnostics"
+                    },
+                    "properties": {
+                        "publisher": "Microsoft.Azure.Diagnostics",
+                        "type": "IaaSDiagnostics",
+                        "typeHandlerVersion": "1.5",
+                        "autoUpgradeMinorVersion": true,
+                        "settings": {
+                            "xmlCfg": "[base64(concat(variables('wadcfgxstart'), variables('wadmetricsresourceid'), variables('dcServerName'), variables('wadcfgxend')))]",
+                            "storageAccount": "[variables('storageAccountName')]"
+                        },
+                        "protectedSettings": {
+                            "storageAccountName": "[variables('storageAccountName')]",
+                            "storageAccountKey": "[listkeys(variables('accountid'), '2015-06-15').key1]",
+                            "storageAccountEndPoint": "https://core.windows.net"
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "apiVersion": "2020-12-01",
+            "name": "[concat(variables('dcServerName'),'/InstallDomainController')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[concat('Microsoft.Compute/virtualMachines/', variables('dcServerName'))]",
+                "[variables('extensionName')]"
+            ],
+            "properties": {
+                "publisher": "Microsoft.Powershell",
+                "type": "DSC",
+                "typeHandlerVersion": "2.19",
+                "autoUpgradeMinorVersion": true,
+                "settings": {
+                    "modulesUrl": "[variables('DSCUri')]",
+                    "configurationFunction": "[variables('dscConfiguration')]",
+                    "properties": {
+                        "domainName": "[parameters('fqDomainName')]",
+                        "addtlDataDiskSize": "[parameters('addtlDataDiskSize')]",
+                        "adminCreds": {
+                            "userName": "[parameters('adminUserName')]",
+                            "password": "PrivateSettingsRef:adminPassword"
+                        }
+                    }
+                },
+                "protectedSettings": {
+                    "items": {
+                        "adminPassword": "[parameters('adminPassword')]"
+                    }
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "apiVersion": "2018-06-01",
+            "name": "[concat(variables('dcServername'),'/getADC')]",
+            "location": "[resourceGroup().location]",
+            "dependsOn": [
+                "[concat('Microsoft.Compute/virtualMachines/', variables('dcServername'))]",
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('dscExtensionName'))]"
+            ],
+            "properties": {
+                "publisher": "Microsoft.Compute",
+                "type": "CustomScriptExtension",
+                "typeHandlerVersion": "1.9",
+                "settings": {
+                    "fileUris": [
+                        "[variables('adConnectUri')]"
+                    ],
+                    "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -file getADC.ps1')]"
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deployments",
+            "apiVersion": "2016-02-01",
+            "name": "[variables('updateVNetDNS1')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('dscExtensionName'))]",
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('adcExtensionName'))]"
+            ],
+            "properties": {
+                "mode": "Incremental",
+                "templateLink": {
+                    "uri": "[variables('configureVnetDNSUri')]",
+                    "contentVersion": "1.0.0.0"
+                },
+                "parameters": {
+                    "virtualNetworkName": {
+                        "value": "[variables('adVnetName')]"
+                    },
+                    "virtualNetworkAddressRange": {
+                        "value": "[variables('vnetAddressRange')]"
+                    },
+                    "dnsServerAddress": {
+                        "value": [
+                            "[variables('dnsServerPrivateIp')]"
+                        ]
+                    },
+                    "subnets": {
+                        "value": "[variables('subnets')]"
+                    },
+                    "deployVPNGateway": {
+                        "value": "[variables('deployVPNGateway')]"
+                    },
+                    "deployBastion": {
+                        "value": "[variables('deployBastion')]"
+                    }
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deployments",
+            "apiVersion": "2016-02-01",
+            "name": "[variables('deployManagementVM')]",
+            "dependsOn": [
+                "[variables('updateVNetDNS1')]",
+                "[variables('secondaryServer')]",
+                "[concat('Microsoft.Compute/virtualMachines/', variables('dcServername'))]",
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('dscExtensionName'))]",
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('adcExtensionName'))]"
+            ],
+            "properties": {
+                "mode": "Incremental",
+                "templateLink": {
+                    "uri": "[variables('managementVMUri')]",
+                    "contentVersion": "1.0.0.0"
+                },
+                "parameters": {
+                    "virtualMachineSize": {
+                        "value": "[parameters('managementVMSize')]"
+                    },
+                    "adminUserName": {
+                        "value": "[parameters('adminUsername')]"
+                    },
+                    "adminPassword": {
+                        "value": "[parameters('adminPassword')]"
+                    },
+                    "managementVMName": {
+                        "value": "[parameters('managementVMName')]"
+                    },
+                    "domainToJoin": {
+                        "value": "[parameters('fqDomainName')]"
+                    },
+                    "virtualNetworkName": {
+                        "value": "[variables('adVnetName')]"
+                    },
+                    "subnetName": {
+                        "value": "[variables('adSubnetName')]"
+                    },
+                    "virtualNetworkResourceGroupName": {
+                        "value": "[variables('resourceGroup')]"
+                    },
+                    "allowRdp": {
+                        "value": "[parameters('allowRdp')]"
+                    }
+                }
+            },
+            "condition": "[parameters('deployManagementVM')]"
+        },
+        {
+            "type": "Microsoft.Resources/deployments",
+            "apiVersion": "2016-02-01",
+            "name": "[variables('secondaryServer')]",
+            "dependsOn": [
+                "[variables('updateVNetDNS1')]",
+                "[concat('Microsoft.Compute/virtualMachines/', variables('dcServername'))]",
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('dscExtensionName'))]",
+                "[resourceId('Microsoft.Compute/virtualMachines/extensions', variables('dcServerName'), variables('adcExtensionName'))]"
+            ],
+            "properties": {
+                "mode": "Incremental",
+                "templateLink": {
+                    "uri": "[variables('secondaryServerUri')]",
+                    "contentVersion": "1.0.0.0"
+                },
+                "parameters": {
+                    "virtualMachineSize": {
+                        "value": "[parameters('secondaryServerSize')]"
+                    },
+                    "windowsOSVersion": {
+                        "value": "[parameters('windowsOSVersion')]"
+                    },
+                    "secondaryServerName": {
+                        "value": "[parameters('secondaryServerName')]"
+                    },
+                    "adminUserName": {
+                        "value": "[parameters('adminUsername')]"
+                    },
+                    "adminPassword": {
+                        "value": "[parameters('adminPassword')]"
+                    },
+                    "domainToJoin": {
+                        "value": "[parameters('fqDomainName')]"
+                    },
+                    "virtualNetworkName": {
+                        "value": "[variables('adVnetName')]"
+                    },
+                    "subnetName": {
+                        "value": "[variables('adSubnetName')]"
+                    },
+                    "virtualNetworkResourceGroupName": {
+                        "value": "[variables('resourceGroup')]"
+                    },
+                    "installADConnect": {
+                        "value": "[parameters('installADConnect')]"
+                    },
+                    "installIIS": {
+                        "value": "[parameters('installIIS')]"
+                    },
+                    "installDHCP": {
+                        "value": "[parameters('installDHCP')]"
+                    },
+                    "allowRdp": {
+                        "value": "[parameters('allowRdp')]"
+                    }
+                }
+            },
+            "condition": "[parameters('deploySecondaryServer')]"
+        },
+        {
+            "type": "Microsoft.Network/publicIPAddresses",
+            "apiVersion": "2019-02-01",
+            "name": "[variables('gatewayPIPName')]",
+            "location": "[variables('location')]",
+            "dependsOn": [
+                "[variables('updateVNetDNS1')]"
+            ],
+            "properties": {
+                "publicIPAllocationMethod": "Dynamic"
+            },
+            "condition": "[equals(parameters('deployVPNGateway'), 'Yes')]"
+        },
+        {
+            "type": "Microsoft.Network/virtualNetworkGateways",
+            "apiVersion": "2020-08-01",
+            "name": "[variables('gatewayName')]",
+            "location": "[variables('location')]",
+            "dependsOn": [
+                "[variables('gatewayPIPName')]"
+            ],
+            "tags": {},
+            "properties": {
+                "gatewayType": "[variables('gatewayType')]",
+                "ipConfigurations": [
+                    {
+                        "name": "default",
+                        "properties": {
+                            "privateIPAllocationMethod": "Dynamic",
+                            "subnet": {
+                                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('adVnetName'), variables('gatewaySubnetName'))]"
+                            },
+                            "publicIpAddress": {
+                                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('gatewayPIPName'))]"
+                            }
+                        }
+                    }
+                ],
+                "vpnType": "[variables('vpnType')]",
+                "vpnGatewayGeneration": "[variables('vpnGatewayGeneration')]",
+                "sku": {
+                    "name": "Basic",
+                    "tier": "Basic"
+                }
+            },
+            "condition": "[equals(variables('deployVPNGateway'), 'Yes')]"
+        }
+    ],
+    "outputs": {
+        "rdshVmNamesObject": {
+            "type": "String",
+            "value": "[variables('localAdminName')]"
+        }
+    }
+}
